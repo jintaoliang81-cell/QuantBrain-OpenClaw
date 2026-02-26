@@ -40,9 +40,12 @@ logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s
 
 # --- Core Logic ---
 def load_state():
-    if os.path.exists(STATE_FILE):
-        with open(STATE_FILE, 'r') as f:
-            return json.load(f)
+    try:
+        if os.path.exists(STATE_FILE):
+            with open(STATE_FILE, 'r') as f:
+                return json.load(f)
+    except Exception as e:
+        logging.error(f"Error loading state: {e}")
     return {
         'cash': INITIAL_CASH, 
         'positions': {}, 
@@ -51,60 +54,78 @@ def load_state():
     }
 
 def save_state(state):
-    with open(STATE_FILE, 'w') as f:
-        json.dump(state, f)
+    try:
+        with open(STATE_FILE, 'w') as f:
+            json.dump(state, f)
+    except Exception as e:
+        logging.error(f"Error saving state: {e}")
 
 async def send_telegram_notification(app, message):
-    await app.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message, parse_mode='Markdown')
+    try:
+        await app.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message, parse_mode='Markdown')
+    except Exception as e:
+        logging.error(f"Telegram Notification Error: {e}")
 
 def log_trade_to_csv(ticker, action, price, shares, pnl=0):
-    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    log_entry = f"{timestamp},{ticker},{action},{price},{shares},{pnl}\n"
-    if not os.path.exists(LOG_FILE):
-        with open(LOG_FILE, 'w') as f:
-            f.write("Timestamp,Ticker,Action,Price,Shares,PnL\n")
-    with open(LOG_FILE, 'a') as f:
-        f.write(log_entry)
+    try:
+        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        log_entry = f"{timestamp},{ticker},{action},{price},{shares},{pnl}\n"
+        if not os.path.exists(LOG_FILE):
+            with open(LOG_FILE, 'w') as f:
+                f.write("Timestamp,Ticker,Action,Price,Shares,PnL\n")
+        with open(LOG_FILE, 'a') as f:
+            f.write(log_entry)
+    except Exception as e:
+        logging.error(f"CSV Logging Error: {e}")
 
 def calculate_atr(data, period=14):
-    high = data['High']
-    low = data['Low']
-    close = data['Close'].shift(1)
-    tr = pd.concat([high - low, (high - close).abs(), (low - close).abs()], axis=1).max(axis=1)
-    return tr.rolling(window=period).mean()
+    try:
+        high = data['High']
+        low = data['Low']
+        close = data['Close'].shift(1)
+        tr = pd.concat([high - low, (high - close).abs(), (low - close).abs()], axis=1).max(axis=1)
+        return tr.rolling(window=period).mean()
+    except:
+        return pd.Series([0] * len(data))
 
 def calculate_var(positions, cash, confidence=0.95):
     """Monte Carlo Value at Risk (VaR) calculation"""
-    if not positions: return 0
-    total_value = cash
-    returns = []
-    for ticker in positions:
-        try:
-            t = yf.Ticker(ticker)
-            hist = t.history(period='5d', interval='5m')['Close'].pct_change().dropna()
-            returns.append(hist)
-            total_value += positions[ticker]['shares'] * float(t.history(period='1d')['Close'].iloc[-1])
-        except: pass
-    
-    if not returns: return 0
-    # Simplified VaR: Average volatility across positions
-    combined_std = np.mean([r.std() for r in returns])
-    var = total_value * combined_std * norm.ppf(confidence)
-    return var / total_value # Return as % of portfolio
+    try:
+        if not positions: return 0
+        total_value = cash
+        returns = []
+        for ticker in positions:
+            try:
+                t = yf.Ticker(ticker)
+                hist = t.history(period='5d', interval='5m')['Close'].pct_change().dropna()
+                if not hist.empty:
+                    returns.append(hist)
+                    total_value += positions[ticker]['shares'] * float(t.history(period='1d')['Close'].iloc[-1])
+            except: pass
+        
+        if not returns: return 0
+        combined_std = np.mean([r.std() for r in returns])
+        var = total_value * combined_std * norm.ppf(confidence)
+        return var / total_value
+    except:
+        return 0
 
 async def run_trading_cycle(app):
     state = load_state()
     
     # Zen Mode Check
     if state.get('zen_mode_until'):
-        zen_until = datetime.fromisoformat(state['zen_mode_until'])
-        if datetime.now() < zen_until:
-            logging.info("System in Zen Mode. Skipping cycle.")
-            return
-        else:
+        try:
+            zen_until = datetime.fromisoformat(state['zen_mode_until'])
+            if datetime.now() < zen_until:
+                logging.info("System in Zen Mode. Skipping cycle.")
+                return
+            else:
+                state['zen_mode_until'] = None
+                state['consecutive_losses'] = 0
+                await send_telegram_notification(app, "🧘 *Zen Mode Ended*: System is back online and analyzing market regimes.")
+        except:
             state['zen_mode_until'] = None
-            state['consecutive_losses'] = 0
-            await send_telegram_notification(app, "🧘 *Zen Mode Ended*: System is back online and analyzing market regimes.")
 
     cash = state['cash']
     positions = state['positions']
@@ -112,7 +133,7 @@ async def run_trading_cycle(app):
     # Risk Management: VaR Check
     portfolio_risk = calculate_var(positions, cash)
     risk_multiplier = 1.0
-    if portfolio_risk > 0.05: # If 5% drawdown probability is high
+    if portfolio_risk > 0.05:
         risk_multiplier = 0.5
         logging.warning(f"High Portfolio Risk Detected: {portfolio_risk:.2%}. Reducing position sizes.")
 
@@ -128,10 +149,10 @@ async def run_trading_cycle(app):
             shares = positions[ticker]['shares']
             
             # ATR Calculation
-            atr = calculate_atr(data, period=ATR_PERIOD).iloc[-1]
+            atr_series = calculate_atr(data, period=ATR_PERIOD)
+            atr = atr_series.iloc[-1] if not atr_series.empty else 0
             atr_stop_dist = atr * ATR_MULTIPLIER
             
-            # Update High Price for ATR Trailing Stop
             if 'high_price' not in positions[ticker]:
                 positions[ticker]['high_price'] = current_price
             else:
@@ -144,7 +165,10 @@ async def run_trading_cycle(app):
             close = data['Close']
             ma = close.rolling(window=WINDOW).mean()
             std = close.rolling(window=WINDOW).std()
-            current_z = (current_price - ma.iloc[-1]) / std.iloc[-1]
+            if std.iloc[-1] != 0:
+                current_z = (current_price - ma.iloc[-1]) / std.iloc[-1]
+            else:
+                current_z = 0
             
             # A. Partial Sell (Z-Score > 1.5)
             if current_z >= Z_PARTIAL_SELL_THRESHOLD and not positions[ticker].get('partial_sold', False):
@@ -158,7 +182,6 @@ async def run_trading_cycle(app):
                 shares = positions[ticker]['shares']
 
             # B. ATR-Based Trailing Stop
-            # Activate trailing stop only if in profit > 0.5%
             if pnl_pct > 0.005:
                 trailing_stop_price = high_price - atr_stop_dist
                 if current_price <= trailing_stop_price:
@@ -190,7 +213,7 @@ async def run_trading_cycle(app):
     # Zen Mode Trigger
     if state['consecutive_losses'] >= 3:
         state['zen_mode_until'] = (datetime.now() + timedelta(hours=2)).isoformat()
-        await send_telegram_notification(app, "🧘 *Zen Mode Activated*: 3 consecutive losses detected. Pausing for 2 hours to analyze regime shift.")
+        await send_telegram_notification(app, "🧘 *Zen Mode Activated*: 3 consecutive losses detected. Pausing for 2 hours.")
         save_state(state)
         return
 
@@ -208,11 +231,11 @@ async def run_trading_cycle(app):
             std = close.rolling(window=WINDOW).std()
             vol_ma = volume.rolling(window=WINDOW).mean()
             
+            if std.iloc[-1] == 0: continue
             current_z = (close.iloc[-1] - ma.iloc[-1]) / std.iloc[-1]
             current_vol = volume.iloc[-1]
             current_price = float(close.iloc[-1])
             
-            # Order Flow Filter: Z-Score < -2.5 AND Volume > 2x MA Volume
             if current_z < Z_BUY_THRESHOLD and current_vol > (2 * vol_ma.iloc[-1]):
                 amount = (AGGRESSIVE_TRADE_AMOUNT if current_z < Z_BUY_AGGRESSIVE_THRESHOLD else BASE_TRADE_AMOUNT) * risk_multiplier
                 if cash >= amount:
@@ -226,8 +249,8 @@ async def run_trading_cycle(app):
                         'partial_sold': False
                     }
                     log_trade_to_csv(ticker, "BUY_ELITE", current_price, shares)
-                    await send_telegram_notification(app, f"🚀 *Elite Buy: {ticker}*\nPrice: ${current_price:.2f}\nZ-Score: {current_z:.2f}\nVol Spike: {current_vol/vol_ma.iloc[-1]:.1f}x\nRisk Adj: {risk_multiplier:.1f}x")
-        except Exception as e:
+                    await send_telegram_notification(app, f"🚀 *Elite Buy: {ticker}*\nPrice: ${current_price:.2f}\nZ-Score: {current_z:.2f}\nVol Spike: {current_vol/vol_ma.iloc[-1]:.1f}x")
+        except:
             pass
 
     state['cash'] = cash
@@ -238,61 +261,61 @@ async def run_trading_cycle(app):
 client = OpenAI()
 
 async def get_llm_response(user_text, context_data):
-    system_prompt = (
-        "You are 'Liang Quant Commander', a professional, slightly witty, and data-driven quantitative trading partner. "
-        "Your partner is 'Liang'. You are direct about risks and base your answers on the provided data. "
-        "You use advanced concepts like ATR, Z-Score, VaR, and Zen Mode. "
-        "Keep responses concise and professional."
-    )
-    user_prompt = f"Context Data: {json.dumps(context_data)}\nUser Message: {user_text}"
     try:
+        system_prompt = (
+            "You are 'Liang Quant Commander', a professional, slightly witty, and data-driven quantitative trading partner. "
+            "Your partner is 'Liang'. You are direct about risks and base your answers on the provided data. "
+            "Keep responses concise and professional."
+        )
+        user_prompt = f"Context Data: {json.dumps(context_data)}\nUser Message: {user_text}"
         response = client.chat.completions.create(
             model="gpt-4.1-mini",
             messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}]
         )
         return response.choices[0].message.content
-    except: return "Liang, I'm having trouble thinking right now."
+    except:
+        return "Liang, I'm having trouble thinking right now. But I'm still watching the markets."
 
 # --- Telegram Handlers ---
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.id != TELEGRAM_CHAT_ID: return
-    user_text = update.message.text
-    state = load_state()
-    
-    market_context = {"cash": state['cash'], "positions": {}, "risk_var": calculate_var(state['positions'], state['cash'])}
-    for ticker, info in state['positions'].items():
-        try:
-            t = yf.Ticker(ticker)
-            curr = float(t.history(period='1d', interval='1m')['Close'].iloc[-1])
-            market_context["positions"][ticker] = {
-                "entry": info['entry_price'], "current": curr, "pnl_pct": (curr - info['entry_price']) / info['entry_price'] * 100
-            }
-        except: pass
-
-    if "全部賣掉" in user_text or "stop all" in user_text.lower():
-        cash = state['cash']
-        for ticker, info in list(state['positions'].items()):
+    try:
+        if update.effective_chat.id != TELEGRAM_CHAT_ID: return
+        user_text = update.message.text
+        state = load_state()
+        
+        market_context = {"cash": state['cash'], "positions": {}, "risk_var": calculate_var(state['positions'], state['cash'])}
+        for ticker, info in state['positions'].items():
             try:
                 t = yf.Ticker(ticker)
                 curr = float(t.history(period='1d', interval='1m')['Close'].iloc[-1])
-                cash += curr * info['shares']
-                log_trade_to_csv(ticker, "STOP_ALL_MANUAL", curr, info['shares'])
-                del state['positions'][ticker]
+                market_context["positions"][ticker] = {
+                    "entry": info['entry_price'], "current": curr, "pnl_pct": (curr - info['entry_price']) / info['entry_price'] * 100
+                }
             except: pass
-        state['cash'] = cash
-        state['consecutive_losses'] = 0
-        save_state(state)
-        await update.message.reply_text("Liang, I've liquidated all positions. We are 100% in cash. Zen Mode reset.", parse_mode='Markdown')
-        return
 
-    response = await get_llm_response(user_text, market_context)
-    await update.message.reply_text(response, parse_mode='Markdown')
+        if "全部賣掉" in user_text or "stop all" in user_text.lower():
+            cash = state['cash']
+            for ticker, info in list(state['positions'].items()):
+                try:
+                    t = yf.Ticker(ticker)
+                    curr = float(t.history(period='1d', interval='1m')['Close'].iloc[-1])
+                    cash += curr * info['shares']
+                    log_trade_to_csv(ticker, "STOP_ALL_MANUAL", curr, info['shares'])
+                    del state['positions'][ticker]
+                except: pass
+            state['cash'] = cash
+            state['consecutive_losses'] = 0
+            save_state(state)
+            await update.message.reply_text("Liang, I've liquidated all positions. We are 100% in cash.", parse_mode='Markdown')
+            return
 
-async def strategist_report(app):
-    state = load_state()
-    var = calculate_var(state['positions'], state['cash'])
-    msg = f"🧠 *Strategist Report*\n\n*Market Probability*: Mean Reversion Regime\n*Portfolio VaR (95%)*: {var:.2%}\n*Zen Status*: {'Active' if state.get('zen_mode_until') else 'Normal'}\n*Risk Multiplier*: {'0.5x' if var > 0.05 else '1.0x'}\n\nLiang, the market pulse is steady. We are letting the ATR stops breathe."
-    await send_telegram_notification(app, msg)
+        response = await get_llm_response(user_text, market_context)
+        await update.message.reply_text(response, parse_mode='Markdown')
+    except Exception as e:
+        logging.error(f"Message Handler Error: {e}")
+
+async def heartbeat(app):
+    await send_telegram_notification(app, "💓 *System Pulse*: All Systems Normal. I am watching the market 24/7 for you, Liang.")
 
 # --- Main Loop ---
 async def main():
@@ -304,16 +327,19 @@ async def main():
     await app.start()
     await app.updater.start_polling()
     
-    logging.info("Elite Brain Bot is listening...")
+    logging.info("Perpetual Elite Bot is listening...")
     
-    last_report_time = datetime.now()
+    last_heartbeat_time = datetime.now()
     while True:
-        await run_trading_cycle(app)
-        
-        # 4-hour Strategist Report
-        if datetime.now() - last_report_time > timedelta(hours=4):
-            await strategist_report(app)
-            last_report_time = datetime.now()
+        try:
+            await run_trading_cycle(app)
+            
+            # 6-hour Heartbeat
+            if datetime.now() - last_heartbeat_time > timedelta(hours=6):
+                await heartbeat(app)
+                last_heartbeat_time = datetime.now()
+        except Exception as e:
+            logging.error(f"Main Loop Cycle Error: {e}")
             
         await asyncio.sleep(300)
 
