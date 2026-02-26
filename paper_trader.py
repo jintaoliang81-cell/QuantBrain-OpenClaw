@@ -7,7 +7,8 @@ import asyncio
 import logging
 from datetime import datetime
 from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
+from openai import OpenAI
 
 # --- Configuration ---
 TICKERS = [
@@ -26,9 +27,10 @@ BASE_TRADE_AMOUNT = 5000.0
 AGGRESSIVE_TRADE_AMOUNT = 10000.0
 INITIAL_CASH = 100000.0
 
-# Telegram Config
+# Telegram & LLM Config
 TELEGRAM_BOT_TOKEN = "8519943787:AAGDrCb26d1h4c_Gfw0sRqGKSjjlfgKn5Bg"
-TELEGRAM_CHAT_ID = 8349528219  # Integer for comparison
+TELEGRAM_CHAT_ID = 8349528219
+# OpenAI API Key is pre-configured in environment
 
 STATE_FILE = '/home/ubuntu/paper_trading_state.json'
 LOG_FILE = '/home/ubuntu/paper_trading_log.csv'
@@ -64,7 +66,6 @@ async def run_trading_cycle(app):
     cash = state['cash']
     positions = state['positions']
     
-    # 1. Manage Existing Positions
     for ticker in list(positions.keys()):
         try:
             t = yf.Ticker(ticker)
@@ -89,7 +90,6 @@ async def run_trading_cycle(app):
             z_score = (close - ma) / std
             current_z = z_score.iloc[-1]
             
-            # Partial Sell
             if current_z >= Z_PARTIAL_SELL_THRESHOLD and not positions[ticker].get('partial_sold', False):
                 sell_shares = shares * 0.5
                 pnl = (current_price - entry_price) * sell_shares
@@ -100,7 +100,6 @@ async def run_trading_cycle(app):
                 await send_telegram_notification(app, f"💰 *Partial Sell: {ticker}*\nPrice: ${current_price:.2f}\nZ-Score: {current_z:.2f}\nPnL: ${pnl:.2f}")
                 shares = positions[ticker]['shares']
 
-            # Trailing Stop
             trailing_stop_active = pnl_pct >= TRAILING_STOP_TRIGGER_PCT
             trailing_stop_price = high_price * (1 - TRAILING_STOP_RETRACEMENT_PCT)
             
@@ -112,7 +111,6 @@ async def run_trading_cycle(app):
                 del positions[ticker]
                 continue
 
-            # Hard Stop-Loss
             if pnl_pct <= -STOP_LOSS_PCT:
                 pnl = (current_price - entry_price) * shares
                 cash += current_price * shares
@@ -124,7 +122,6 @@ async def run_trading_cycle(app):
         except Exception as e:
             logging.error(f"Error managing {ticker}: {e}")
 
-    # 2. Scan for New Opportunities
     for ticker in TICKERS:
         if ticker in positions: continue
         try:
@@ -160,68 +157,91 @@ async def run_trading_cycle(app):
     state['positions'] = positions
     save_state(state)
 
+# --- NLP & LLM Logic ---
+client = OpenAI()
+
+async def get_llm_response(user_text, context_data):
+    system_prompt = (
+        "You are 'Liang Quant Commander', a professional, slightly witty, and data-driven quantitative trading partner. "
+        "Your partner is 'Liang'. You are direct about risks and base your answers on the provided data. "
+        "If the user wants to see status, positions, or balance, interpret their intent and provide the info. "
+        "If they want to sell everything, confirm the intent. "
+        "Keep responses concise and professional."
+    )
+    user_prompt = f"Context Data: {json.dumps(context_data)}\nUser Message: {user_text}"
+    
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4.1-mini",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ]
+        )
+        return response.choices[0].message.content
+    except Exception as e:
+        return f"Liang, I'm having trouble thinking right now. Error: {e}"
+
 # --- Telegram Handlers ---
-async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id != TELEGRAM_CHAT_ID: return
+    user_text = update.message.text
     state = load_state()
-    total_equity = state['cash']
-    pos_str = ""
+    
+    # Gather current market data for context
+    market_context = {"cash": state['cash'], "positions": {}}
     for ticker, info in state['positions'].items():
         try:
             t = yf.Ticker(ticker)
             curr = float(t.history(period='1d', interval='1m')['Close'].iloc[-1])
-            pnl = (curr - info['entry_price']) / info['entry_price'] * 100
-            total_equity += curr * info['shares']
-            pos_str += f"• {ticker}: ${curr:.2f} ({pnl:+.2f}%)\n"
-        except: pos_str += f"• {ticker}: Error fetching price\n"
-    
-    if not pos_str: pos_str = "None\n"
-    msg = f"📊 *Current Portfolio*\n{pos_str}\n*Balance*: ${total_equity:,.2f}\n*Cash*: ${state['cash']:,.2f}"
-    await update.message.reply_text(msg, parse_mode='Markdown')
+            market_context["positions"][ticker] = {
+                "entry": info['entry_price'],
+                "current": curr,
+                "pnl_pct": (curr - info['entry_price']) / info['entry_price'] * 100
+            }
+        except: pass
 
-async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.id != TELEGRAM_CHAT_ID: return
-    state = load_state()
-    await update.message.reply_text(f"💰 *Available Cash*: ${state['cash']:,.2f}", parse_mode='Markdown')
-
-async def positions_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.id != TELEGRAM_CHAT_ID: return
-    state = load_state()
-    if 'NVDA' not in state['positions']:
-        await update.message.reply_text("❌ No active NVDA position.")
+    # Special Command: Stop All
+    if "全部賣掉" in user_text or "stop all" in user_text.lower():
+        cash = state['cash']
+        for ticker, info in list(state['positions'].items()):
+            try:
+                t = yf.Ticker(ticker)
+                curr = float(t.history(period='1d', interval='1m')['Close'].iloc[-1])
+                cash += curr * info['shares']
+                log_trade_to_csv(ticker, "STOP_ALL_MANUAL", curr, info['shares'])
+                del state['positions'][ticker]
+            except: pass
+        state['cash'] = cash
+        save_state(state)
+        await update.message.reply_text("Liang, I've liquidated all positions as requested. We are 100% in cash now. Safety first.", parse_mode='Markdown')
         return
-    
-    try:
-        t = yf.Ticker('NVDA')
-        data = t.history(period='1d', interval='5m')
-        close = data['Close']
-        ma = close.rolling(window=WINDOW).mean()
-        std = close.rolling(window=WINDOW).std()
-        z = (close.iloc[-1] - ma.iloc[-1]) / std.iloc[-1]
-        entry = state['positions']['NVDA']['entry_price']
-        await update.message.reply_text(f"🎯 *NVDA Status*\nEntry: ${entry:.2f}\nCurrent Z-Score: {z:.2f}", parse_mode='Markdown')
-    except Exception as e:
-        await update.message.reply_text(f"Error: {e}")
+
+    # General NLP Response
+    response = await get_llm_response(user_text, market_context)
+    await update.message.reply_text(response, parse_mode='Markdown')
+
+async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await handle_message(update, context) # Let NLP handle it
 
 # --- Main Loop ---
 async def main():
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
     
-    # Add handlers
-    app.add_handler(CommandHandler("status", status))
-    app.add_handler(CommandHandler("balance", balance))
-    app.add_handler(CommandHandler("positions", positions_cmd))
+    app.add_handler(CommandHandler("status", handle_message))
+    app.add_handler(CommandHandler("balance", handle_message))
+    app.add_handler(CommandHandler("positions", handle_message))
+    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
     
     await app.initialize()
     await app.start()
     await app.updater.start_polling()
     
-    logging.info("Bot is listening...")
+    logging.info("NLP Bot is listening...")
     
-    # Trading Loop
     while True:
         await run_trading_cycle(app)
-        await asyncio.sleep(300) # 5 minutes
+        await asyncio.sleep(300)
 
 if __name__ == "__main__":
     asyncio.run(main())
