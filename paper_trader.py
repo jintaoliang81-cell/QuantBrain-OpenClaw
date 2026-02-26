@@ -3,6 +3,7 @@ import pandas as pd
 import numpy as np
 import os
 import json
+import requests
 from datetime import datetime
 
 # Configuration
@@ -22,8 +23,20 @@ BASE_TRADE_AMOUNT = 5000.0
 AGGRESSIVE_TRADE_AMOUNT = 10000.0
 INITIAL_CASH = 100000.0
 
+# Telegram Config
+TELEGRAM_BOT_TOKEN = "8519943787:AAGDrCb26d1h4c_Gfw0sRqGKSjjlfgKn5Bg"
+TELEGRAM_CHAT_ID = "8349528219"
+
 STATE_FILE = '/home/ubuntu/paper_trading_state.json'
 LOG_FILE = '/home/ubuntu/paper_trading_log.csv'
+
+def send_telegram_msg(message):
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}
+    try:
+        requests.post(url, json=payload, timeout=10)
+    except Exception as e:
+        print(f"Telegram Error: {e}")
 
 def load_state():
     if os.path.exists(STATE_FILE):
@@ -43,6 +56,10 @@ def log_trade(ticker, action, price, shares, pnl=0):
             f.write("Timestamp,Ticker,Action,Price,Shares,PnL\n")
     with open(LOG_FILE, 'a') as f:
         f.write(log_entry)
+    
+    # Send Telegram Notification
+    msg = f"🚀 *Trade Alert: {action}*\nTicker: {ticker}\nPrice: ${price:.2f}\nShares: {shares:.4f}\nPnL: ${pnl:.2f}"
+    send_telegram_msg(msg)
 
 def run_trading_cycle():
     state = load_state()
@@ -87,7 +104,7 @@ def run_trading_cycle():
                 positions[ticker]['partial_sold'] = True
                 log_trade(ticker, "PARTIAL_SELL_Z1.5", current_price, sell_shares, pnl)
                 print(f"PARTIAL SELL {ticker}: Z-Score {current_z:.2f} at ${current_price:.2f} | PnL: ${pnl:.2f}")
-                shares = positions[ticker]['shares'] # Update local shares for next checks
+                shares = positions[ticker]['shares']
 
             # B. Trailing Stop Logic
             trailing_stop_active = pnl_pct >= TRAILING_STOP_TRIGGER_PCT
@@ -161,7 +178,6 @@ def run_trading_cycle():
             pnl_pct = (curr_price - info['entry_price']) / info['entry_price'] * 100
             total_equity += curr_price * info['shares']
             
-            # Calculate current trailing stop level
             high_p = max(info.get('high_price', curr_price), curr_price)
             ts_level = high_p * (1 - TRAILING_STOP_RETRACEMENT_PCT)
             ts_status = f"Active (Level: ${ts_level:.2f})" if pnl_pct >= (TRAILING_STOP_TRIGGER_PCT * 100) else "Pending"
