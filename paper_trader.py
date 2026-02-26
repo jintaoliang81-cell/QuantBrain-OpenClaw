@@ -3,10 +3,13 @@ import pandas as pd
 import numpy as np
 import os
 import json
-import requests
+import asyncio
+import logging
 from datetime import datetime
+from telegram import Update
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-# Configuration
+# --- Configuration ---
 TICKERS = [
     'AAPL', 'MSFT', 'GOOGL', 'AMZN', 'NVDA', 'META', 'TSLA', 'AVGO', 'PEP', 'COST',
     'ADBE', 'CSCO', 'NFLX', 'AMD', 'INTC', 'CMCSA', 'TMUS', 'AMGN', 'TXN', 'HON',
@@ -25,19 +28,15 @@ INITIAL_CASH = 100000.0
 
 # Telegram Config
 TELEGRAM_BOT_TOKEN = "8519943787:AAGDrCb26d1h4c_Gfw0sRqGKSjjlfgKn5Bg"
-TELEGRAM_CHAT_ID = "8349528219"
+TELEGRAM_CHAT_ID = 8349528219  # Integer for comparison
 
 STATE_FILE = '/home/ubuntu/paper_trading_state.json'
 LOG_FILE = '/home/ubuntu/paper_trading_log.csv'
 
-def send_telegram_msg(message):
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}
-    try:
-        requests.post(url, json=payload, timeout=10)
-    except Exception as e:
-        print(f"Telegram Error: {e}")
+# Logging
+logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 
+# --- Core Logic ---
 def load_state():
     if os.path.exists(STATE_FILE):
         with open(STATE_FILE, 'r') as f:
@@ -48,7 +47,10 @@ def save_state(state):
     with open(STATE_FILE, 'w') as f:
         json.dump(state, f)
 
-def log_trade(ticker, action, price, shares, pnl=0):
+async def send_telegram_notification(app, message):
+    await app.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message, parse_mode='Markdown')
+
+def log_trade_to_csv(ticker, action, price, shares, pnl=0):
     timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     log_entry = f"{timestamp},{ticker},{action},{price},{shares},{pnl}\n"
     if not os.path.exists(LOG_FILE):
@@ -56,17 +58,11 @@ def log_trade(ticker, action, price, shares, pnl=0):
             f.write("Timestamp,Ticker,Action,Price,Shares,PnL\n")
     with open(LOG_FILE, 'a') as f:
         f.write(log_entry)
-    
-    # Send Telegram Notification
-    msg = f"🚀 *Trade Alert: {action}*\nTicker: {ticker}\nPrice: ${price:.2f}\nShares: {shares:.4f}\nPnL: ${pnl:.2f}"
-    send_telegram_msg(msg)
 
-def run_trading_cycle():
+async def run_trading_cycle(app):
     state = load_state()
     cash = state['cash']
     positions = state['positions']
-    
-    print(f"--- Aggressive Trading Cycle: {datetime.now().strftime('%H:%M:%S')} ---")
     
     # 1. Manage Existing Positions
     for ticker in list(positions.keys()):
@@ -79,7 +75,6 @@ def run_trading_cycle():
             entry_price = positions[ticker]['entry_price']
             shares = positions[ticker]['shares']
             
-            # Update High Price for Trailing Stop
             if 'high_price' not in positions[ticker]:
                 positions[ticker]['high_price'] = current_price
             else:
@@ -88,47 +83,46 @@ def run_trading_cycle():
             high_price = positions[ticker]['high_price']
             pnl_pct = (current_price - entry_price) / entry_price
             
-            # Calculate Z-Score
             close = data['Close']
             ma = close.rolling(window=WINDOW).mean()
             std = close.rolling(window=WINDOW).std()
             z_score = (close - ma) / std
             current_z = z_score.iloc[-1]
             
-            # A. Partial Sell (Z-Score > 1.5)
+            # Partial Sell
             if current_z >= Z_PARTIAL_SELL_THRESHOLD and not positions[ticker].get('partial_sold', False):
                 sell_shares = shares * 0.5
                 pnl = (current_price - entry_price) * sell_shares
                 cash += current_price * sell_shares
                 positions[ticker]['shares'] -= sell_shares
                 positions[ticker]['partial_sold'] = True
-                log_trade(ticker, "PARTIAL_SELL_Z1.5", current_price, sell_shares, pnl)
-                print(f"PARTIAL SELL {ticker}: Z-Score {current_z:.2f} at ${current_price:.2f} | PnL: ${pnl:.2f}")
+                log_trade_to_csv(ticker, "PARTIAL_SELL", current_price, sell_shares, pnl)
+                await send_telegram_notification(app, f"💰 *Partial Sell: {ticker}*\nPrice: ${current_price:.2f}\nZ-Score: {current_z:.2f}\nPnL: ${pnl:.2f}")
                 shares = positions[ticker]['shares']
 
-            # B. Trailing Stop Logic
+            # Trailing Stop
             trailing_stop_active = pnl_pct >= TRAILING_STOP_TRIGGER_PCT
             trailing_stop_price = high_price * (1 - TRAILING_STOP_RETRACEMENT_PCT)
             
             if trailing_stop_active and current_price <= trailing_stop_price:
                 pnl = (current_price - entry_price) * shares
                 cash += current_price * shares
-                log_trade(ticker, "TRAILING_STOP_EXIT", current_price, shares, pnl)
-                print(f"EXIT {ticker}: Trailing Stop at ${current_price:.2f} | PnL: ${pnl:.2f}")
+                log_trade_to_csv(ticker, "TRAILING_STOP", current_price, shares, pnl)
+                await send_telegram_notification(app, f"🛑 *Trailing Stop: {ticker}*\nExit Price: ${current_price:.2f}\nPnL: ${pnl:.2f}")
                 del positions[ticker]
                 continue
 
-            # C. Hard Stop-Loss
+            # Hard Stop-Loss
             if pnl_pct <= -STOP_LOSS_PCT:
                 pnl = (current_price - entry_price) * shares
                 cash += current_price * shares
-                log_trade(ticker, "HARD_STOP_LOSS", current_price, shares, pnl)
-                print(f"EXIT {ticker}: Hard Stop-Loss at ${current_price:.2f} | PnL: ${pnl:.2f}")
+                log_trade_to_csv(ticker, "STOP_LOSS", current_price, shares, pnl)
+                await send_telegram_notification(app, f"⚠️ *Stop Loss: {ticker}*\nExit Price: ${current_price:.2f}\nPnL: ${pnl:.2f}")
                 del positions[ticker]
                 continue
 
         except Exception as e:
-            print(f"Error managing {ticker}: {e}")
+            logging.error(f"Error managing {ticker}: {e}")
 
     # 2. Scan for New Opportunities
     for ticker in TICKERS:
@@ -157,35 +151,77 @@ def run_trading_cycle():
                         'high_price': current_price,
                         'partial_sold': False
                     }
-                    log_trade(ticker, "BUY_AGGRESSIVE" if current_z < Z_BUY_AGGRESSIVE_THRESHOLD else "BUY", current_price, shares)
-                    print(f"BUY {ticker}: Z-Score {current_z:.2f} at ${current_price:.2f} | Amount: ${amount}")
+                    log_trade_to_csv(ticker, "BUY", current_price, shares)
+                    await send_telegram_notification(app, f"🚀 *Buy Alert: {ticker}*\nPrice: ${current_price:.2f}\nZ-Score: {current_z:.2f}\nAmount: ${amount}")
         except Exception as e:
             pass
 
-    # 3. Save State and Display Status
     state['cash'] = cash
     state['positions'] = positions
     save_state(state)
-    
-    total_equity = cash
-    print("\n--- Active Trades (Aggressive Mode) ---")
-    if not positions:
-        print("None")
-    for ticker, info in positions.items():
+
+# --- Telegram Handlers ---
+async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.id != TELEGRAM_CHAT_ID: return
+    state = load_state()
+    total_equity = state['cash']
+    pos_str = ""
+    for ticker, info in state['positions'].items():
         try:
             t = yf.Ticker(ticker)
-            curr_price = float(t.history(period='1d', interval='1m')['Close'].iloc[-1])
-            pnl_pct = (curr_price - info['entry_price']) / info['entry_price'] * 100
-            total_equity += curr_price * info['shares']
-            
-            high_p = max(info.get('high_price', curr_price), curr_price)
-            ts_level = high_p * (1 - TRAILING_STOP_RETRACEMENT_PCT)
-            ts_status = f"Active (Level: ${ts_level:.2f})" if pnl_pct >= (TRAILING_STOP_TRIGGER_PCT * 100) else "Pending"
-            
-            print(f"{ticker} | Entry: ${info['entry_price']:.2f} | Curr: ${curr_price:.2f} | P/L: {pnl_pct:.2f}% | TS: {ts_status}")
-        except: pass
+            curr = float(t.history(period='1d', interval='1m')['Close'].iloc[-1])
+            pnl = (curr - info['entry_price']) / info['entry_price'] * 100
+            total_equity += curr * info['shares']
+            pos_str += f"• {ticker}: ${curr:.2f} ({pnl:+.2f}%)\n"
+        except: pos_str += f"• {ticker}: Error fetching price\n"
     
-    print(f"\nAccount Balance: ${total_equity:.2f} (Cash: ${cash:.2f})")
+    if not pos_str: pos_str = "None\n"
+    msg = f"📊 *Current Portfolio*\n{pos_str}\n*Balance*: ${total_equity:,.2f}\n*Cash*: ${state['cash']:,.2f}"
+    await update.message.reply_text(msg, parse_mode='Markdown')
+
+async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.id != TELEGRAM_CHAT_ID: return
+    state = load_state()
+    await update.message.reply_text(f"💰 *Available Cash*: ${state['cash']:,.2f}", parse_mode='Markdown')
+
+async def positions_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.id != TELEGRAM_CHAT_ID: return
+    state = load_state()
+    if 'NVDA' not in state['positions']:
+        await update.message.reply_text("❌ No active NVDA position.")
+        return
+    
+    try:
+        t = yf.Ticker('NVDA')
+        data = t.history(period='1d', interval='5m')
+        close = data['Close']
+        ma = close.rolling(window=WINDOW).mean()
+        std = close.rolling(window=WINDOW).std()
+        z = (close.iloc[-1] - ma.iloc[-1]) / std.iloc[-1]
+        entry = state['positions']['NVDA']['entry_price']
+        await update.message.reply_text(f"🎯 *NVDA Status*\nEntry: ${entry:.2f}\nCurrent Z-Score: {z:.2f}", parse_mode='Markdown')
+    except Exception as e:
+        await update.message.reply_text(f"Error: {e}")
+
+# --- Main Loop ---
+async def main():
+    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+    
+    # Add handlers
+    app.add_handler(CommandHandler("status", status))
+    app.add_handler(CommandHandler("balance", balance))
+    app.add_handler(CommandHandler("positions", positions_cmd))
+    
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling()
+    
+    logging.info("Bot is listening...")
+    
+    # Trading Loop
+    while True:
+        await run_trading_cycle(app)
+        await asyncio.sleep(300) # 5 minutes
 
 if __name__ == "__main__":
-    run_trading_cycle()
+    asyncio.run(main())
