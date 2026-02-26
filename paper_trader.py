@@ -13,9 +13,13 @@ TICKERS = [
 ]
 WINDOW = 20
 Z_BUY_THRESHOLD = -2.5
-Z_SELL_THRESHOLD = 0.0
+Z_BUY_AGGRESSIVE_THRESHOLD = -3.0
+Z_PARTIAL_SELL_THRESHOLD = 1.5
 STOP_LOSS_PCT = 0.015
-TRADE_AMOUNT = 5000.0
+TRAILING_STOP_TRIGGER_PCT = 0.010
+TRAILING_STOP_RETRACEMENT_PCT = 0.005
+BASE_TRADE_AMOUNT = 5000.0
+AGGRESSIVE_TRADE_AMOUNT = 10000.0
 INITIAL_CASH = 100000.0
 
 STATE_FILE = '/home/ubuntu/paper_trading_state.json'
@@ -45,9 +49,9 @@ def run_trading_cycle():
     cash = state['cash']
     positions = state['positions']
     
-    print(f"--- Trading Cycle: {datetime.now().strftime('%H:%M:%S')} ---")
+    print(f"--- Aggressive Trading Cycle: {datetime.now().strftime('%H:%M:%S')} ---")
     
-    # 1. Manage Existing Positions (Sell/Stop-Loss)
+    # 1. Manage Existing Positions
     for ticker in list(positions.keys()):
         try:
             t = yf.Ticker(ticker)
@@ -58,23 +62,54 @@ def run_trading_cycle():
             entry_price = positions[ticker]['entry_price']
             shares = positions[ticker]['shares']
             
-            # Calculate Z-Score for Exit
+            # Update High Price for Trailing Stop
+            if 'high_price' not in positions[ticker]:
+                positions[ticker]['high_price'] = current_price
+            else:
+                positions[ticker]['high_price'] = max(positions[ticker]['high_price'], current_price)
+            
+            high_price = positions[ticker]['high_price']
+            pnl_pct = (current_price - entry_price) / entry_price
+            
+            # Calculate Z-Score
             close = data['Close']
             ma = close.rolling(window=WINDOW).mean()
             std = close.rolling(window=WINDOW).std()
             z_score = (close - ma) / std
             current_z = z_score.iloc[-1]
             
-            # Exit Logic: Z-Score returns to 0 OR Stop-Loss
-            pnl_pct = (current_price - entry_price) / entry_price
+            # A. Partial Sell (Z-Score > 1.5)
+            if current_z >= Z_PARTIAL_SELL_THRESHOLD and not positions[ticker].get('partial_sold', False):
+                sell_shares = shares * 0.5
+                pnl = (current_price - entry_price) * sell_shares
+                cash += current_price * sell_shares
+                positions[ticker]['shares'] -= sell_shares
+                positions[ticker]['partial_sold'] = True
+                log_trade(ticker, "PARTIAL_SELL_Z1.5", current_price, sell_shares, pnl)
+                print(f"PARTIAL SELL {ticker}: Z-Score {current_z:.2f} at ${current_price:.2f} | PnL: ${pnl:.2f}")
+                shares = positions[ticker]['shares'] # Update local shares for next checks
+
+            # B. Trailing Stop Logic
+            trailing_stop_active = pnl_pct >= TRAILING_STOP_TRIGGER_PCT
+            trailing_stop_price = high_price * (1 - TRAILING_STOP_RETRACEMENT_PCT)
             
-            if current_z >= Z_SELL_THRESHOLD or pnl_pct <= -STOP_LOSS_PCT:
+            if trailing_stop_active and current_price <= trailing_stop_price:
                 pnl = (current_price - entry_price) * shares
                 cash += current_price * shares
-                action = "SELL_EXIT" if current_z >= Z_SELL_THRESHOLD else "STOP_LOSS"
-                log_trade(ticker, action, current_price, shares, pnl)
-                print(f"EXIT {ticker}: {action} at ${current_price:.2f} | PnL: ${pnl:.2f}")
+                log_trade(ticker, "TRAILING_STOP_EXIT", current_price, shares, pnl)
+                print(f"EXIT {ticker}: Trailing Stop at ${current_price:.2f} | PnL: ${pnl:.2f}")
                 del positions[ticker]
+                continue
+
+            # C. Hard Stop-Loss
+            if pnl_pct <= -STOP_LOSS_PCT:
+                pnl = (current_price - entry_price) * shares
+                cash += current_price * shares
+                log_trade(ticker, "HARD_STOP_LOSS", current_price, shares, pnl)
+                print(f"EXIT {ticker}: Hard Stop-Loss at ${current_price:.2f} | PnL: ${pnl:.2f}")
+                del positions[ticker]
+                continue
+
         except Exception as e:
             print(f"Error managing {ticker}: {e}")
 
@@ -93,16 +128,20 @@ def run_trading_cycle():
             current_z = z_score.iloc[-1]
             current_price = float(close.iloc[-1])
             
-            if current_z < Z_BUY_THRESHOLD and cash >= TRADE_AMOUNT:
-                shares = TRADE_AMOUNT / current_price
-                cash -= TRADE_AMOUNT
-                positions[ticker] = {
-                    'entry_price': current_price,
-                    'shares': shares,
-                    'entry_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                }
-                log_trade(ticker, "BUY", current_price, shares)
-                print(f"BUY {ticker}: Z-Score {current_z:.2f} at ${current_price:.2f}")
+            if current_z < Z_BUY_THRESHOLD:
+                amount = AGGRESSIVE_TRADE_AMOUNT if current_z < Z_BUY_AGGRESSIVE_THRESHOLD else BASE_TRADE_AMOUNT
+                if cash >= amount:
+                    shares = amount / current_price
+                    cash -= amount
+                    positions[ticker] = {
+                        'entry_price': current_price,
+                        'shares': shares,
+                        'entry_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                        'high_price': current_price,
+                        'partial_sold': False
+                    }
+                    log_trade(ticker, "BUY_AGGRESSIVE" if current_z < Z_BUY_AGGRESSIVE_THRESHOLD else "BUY", current_price, shares)
+                    print(f"BUY {ticker}: Z-Score {current_z:.2f} at ${current_price:.2f} | Amount: ${amount}")
         except Exception as e:
             pass
 
@@ -112,7 +151,7 @@ def run_trading_cycle():
     save_state(state)
     
     total_equity = cash
-    print("\n--- Active Trades ---")
+    print("\n--- Active Trades (Aggressive Mode) ---")
     if not positions:
         print("None")
     for ticker, info in positions.items():
@@ -121,7 +160,13 @@ def run_trading_cycle():
             curr_price = float(t.history(period='1d', interval='1m')['Close'].iloc[-1])
             pnl_pct = (curr_price - info['entry_price']) / info['entry_price'] * 100
             total_equity += curr_price * info['shares']
-            print(f"{ticker} | Entry: ${info['entry_price']:.2f} | Curr: ${curr_price:.2f} | P/L: {pnl_pct:.2f}%")
+            
+            # Calculate current trailing stop level
+            high_p = max(info.get('high_price', curr_price), curr_price)
+            ts_level = high_p * (1 - TRAILING_STOP_RETRACEMENT_PCT)
+            ts_status = f"Active (Level: ${ts_level:.2f})" if pnl_pct >= (TRAILING_STOP_TRIGGER_PCT * 100) else "Pending"
+            
+            print(f"{ticker} | Entry: ${info['entry_price']:.2f} | Curr: ${curr_price:.2f} | P/L: {pnl_pct:.2f}% | TS: {ts_status}")
         except: pass
     
     print(f"\nAccount Balance: ${total_equity:.2f} (Cash: ${cash:.2f})")
